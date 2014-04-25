@@ -4,6 +4,7 @@ RUN apt-get update && apt-get install cron && apt-get remove -y build-essential 
 RUN backup generate:config
 
 ADD start.sh /Backup/
+ADD schedule.rb /Backup/
 
 WORKDIR /Backup
 
