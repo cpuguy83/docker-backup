@@ -18,3 +18,5 @@
 # # end
 #
 # # Learn more: http://github.com/javan/whenever
+
+job_type :backup, "source /Backup/.env && cd /Backup && backup perform -t :task :output"
