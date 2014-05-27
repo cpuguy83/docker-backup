@@ -9,6 +9,7 @@ RUN backup generate:config
 
 ADD start.sh /Backup/
 ADD schedule.rb /Backup/
+ADD volbackup.rb /volbackup.rb
 
 WORKDIR /Backup
 
