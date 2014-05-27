@@ -1,6 +1,7 @@
 #!/usr/bin/env ruby
 require 'optparse'
 require 'ostruct'
+require 'open-uri'
 
 containers = []
 host = ""
@@ -25,8 +26,11 @@ opts_parser = OptionParser.new do |opts|
     host = h
   end
 
-  opts.on("-s", "--sock", "Location of Docker socket") do |s|
-    docker_sock = s
+  opts.on("-s", "--sock", "Location of Docker socket") do |sock|
+    if sock /^\//
+      sock = "unix://#{sock}"
+    end
+    docker_sock = sock
   end
 
   opts.on("-u", "--user", "RSync/SSH user") do |u|
@@ -54,7 +58,7 @@ opts_parser.parse!(ARGV)
 raise OptionParser::MissingArgument, "Must provide host" if host.empty?
 
 ssh_port ||= 22
-ssh_key_path ||= "#{Dir.home}/.ssh/id_rsa"
+ssh_key_path ||= "/Backup/.ssh/id_rsa"
 ssh_user ||= "backup"
 docker_sock ||= "/var/run/docker.sock"
 
@@ -72,9 +76,16 @@ containers.each do |container|
   volumes << `docker inspect --format '{{ $name := .Name }}{{ range $volPath, $hostPath := .Volumes }}-v {{ $hostPath }}:/volData{{$name}}{{ $volPath }} {{ end }}' #{container}`
 end
 
-rsync_opts = "-e ssh -i #{ssh_key_path} -p #{ssh_port} -rzop --partial /volData #{rsync_user}@#{rsync_host}:#{remote_path} "
+ssh_key = open(ssh_key_path).read
+hostname = `hostname`
+system("/usr/bin/docker", "-H", sock, "run", "--name", "_tmp_#{hostname}_ssh_key", "-v", "/tmp", "--entrypoint", "/bin/bash", "debian:jessie", "-c \"echo #{ssh_key} >> /tmp/id_rsa && chmod 600 /tmp/id_rsa")
+
+
+rsync_opts = "-e ssh -i /tmp/id_rsa -p #{ssh_port} -rzop --partial /volData #{rsync_user}@#{rsync_host}:#{remote_path} "
 if rsync_extra_opts.any?
   rsync_opts << rsync_extra_opts.join(" ")
 end
 
-exec("/usr/bin/docker", "-H", sock, "--rm", "-v", volumes.chomp, "cpuguy83/rsync", *rsnyc_opts.split)
+
+system("/usr/bin/docker", "-H", sock, "run", "--volumes-from", "_tmp_#{hostname}_ssh_key", "--rm", "-v", volumes.chomp, "cpuguy83/rsync", *rsnyc_opts.split)
+system("/usr/bin/docker", "-H", sock, "rm", "_tmp_#{hostname}_ssh_key")
