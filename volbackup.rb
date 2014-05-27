@@ -27,9 +27,7 @@ opts_parser = OptionParser.new do |opts|
   end
 
   opts.on("-s", "--sock", "Location of Docker socket") do |sock|
-    if sock /^\//
-      sock = "unix://#{sock}"
-    end
+    sock = "unix://#{sock}" if sock =~ /^\//
     docker_sock = sock
   end
 
