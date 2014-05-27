@@ -45,7 +45,7 @@ opts_parser = OptionParser.new do |opts|
     remote_path = path
   end
 
-  opts.on("-s", "--rsync-opt", "Extra rsync options") do |opt|
+  opts.on("--rsync-opt", "Extra rsync options") do |opt|
     rsync_extra_opts << opt
   end
 end
