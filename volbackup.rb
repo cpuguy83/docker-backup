@@ -1,89 +1,86 @@
 #!/usr/bin/env ruby
-require 'optparse'
-require 'ostruct'
 require 'open-uri'
+begin
+  gem 'slop'
+rescue Gem::LoadError
+  `gem install slop`
+end
+require 'slop'
 
-containers = []
-host = ""
-docker_sock = ""
-rsync_user = ""
-ssh_key_path = ""
-ssh_port = ""
-rsync_extra_opts = []
-remote_path = ""
 
-opts_parser = OptionParser.new do |opts|
-  opts.banner = "Usage: rsync.rb [options]"
-
-  opts.separator ""
-  opts.separator "Sepcific options"
-
-  opts.on("-c", "--container", "Name/ID of Container to backup volumes for") do |c|
-    containers << c
+class Volume
+  attr_reader :host_path, :container_path
+  def initialize(host, container)
+    @host_path = host
+    @container_path = container
   end
 
-  opts.on("-h", "--host", "Remote host to sync backups to, format: <user@>host<:port>") do |h|
-    host = h
+  def ==(other)
+    host_path == other.host_path
   end
 
-  opts.on("-s", "--sock", "Location of Docker socket") do |sock|
-    sock = "unix://#{sock}" if sock =~ /^\//
-    docker_sock = sock
+  def hash
+    [host_path, Volume].hash
   end
 
-  opts.on("-u", "--user", "RSync/SSH user") do |u|
-    rsync_user = u
+  alias_method :eql?, :==
+
+  def to_s
+    "#{host_path}:#{container_path}"
   end
 
-  opts.on("-k", "--key", "RSync/SSH key path") do |key|
-    ssh_key_path = key
-  end
-
-  opts.on("-p", "--port", "RSync/SSH port") do |port|
-    ssh_port = port
-  end
-
-  opts.on("-r", "--remote-path", "Path to store data on remote server") do |path|
-    remote_path = path
-  end
-
-  opts.on("--rsync-opt", "Extra rsync options") do |opt|
-    rsync_extra_opts << opt
+  def to_cli_arg
+    ['-v', to_s]
   end
 end
-opts_parser.parse!(ARGV)
 
-raise OptionParser::MissingArgument, "Must provide host" if host.empty?
+opts = Slop.parse(arguments: true) do
+  banner "volbackup.rb [options]"
 
-ssh_port ||= 22
-ssh_key_path ||= "/Backup/.ssh/id_rsa"
-ssh_user ||= "backup"
-docker_sock ||= "/var/run/docker.sock"
+  on 'c', 'containers', 'Comma-sepparated list(no spaces) of Name/ID of Containers to backup volumes for', as: Array, default: []
+  on 'h', 'host', 'Remote host to sync backups to, format: <user@>host<:port>', required: true
+  on 'u', 'user', 'RSync/SSH user', default: 'backup'
+  on 'k', 'key', 'RSync/SSH key path', default: '/Backup/.ssh/id_rsa'
+  on 'p', 'port', 'RSync/SSH port', default: 22
+  on 's', 'sock', 'Location of Docker socket', default: '/var/run/docker.sock'
+  on 'r', 'remote_path', 'Path to store data on remote server', default: '~/backups/'
+  on 'b', 'bwlimit', 'Throttle bandwidth, KBPS', default: 0
+end
+
+sock = if opts[:sock] =~ /^\//
+         "unix://#{opts[:sock]}"
+       else
+         opts[:sock]
+       end
+
 
 if File.exists?("/.dockerinit") && !File.exists?("/usr/bin/docker")
   system("cp", "/.dockerinit", "/usr/bin/docker")
 end
 
-if containers.empty?
-  cids = `docker ps -a -q`
+if opts[:containers].empty?
+  cids = `docker -H #{sock} ps -a -q`
   containers = cids.split
+else
+  containers = opts[:containers]
 end
 
-volumes = ''
-containers.each do |container|
-  volumes << `docker inspect --format '{{ $name := .Name }}{{ range $volPath, $hostPath := .Volumes }}-v {{ $hostPath }}:/volData{{$name}}{{ $volPath }} {{ end }}' #{container}`
+volumes = containers.inject([]) { |result, container|
+  vols = `docker -H #{sock} inspect --format '{{ $name := .Name }}{{ range $volPath, $hostPath := .Volumes }}{{ $hostPath }}:/volData{{$name}}{{ $volPath }} {{ end }}' #{container}`.chomp.split(' ')
+  result + vols.map{|v| v.split(':')}.map{|v| Volume.new(v[0], v[1])}
+}.uniq
+
+
+hostname = `hostname`.chomp
+
+begin
+system("/usr/bin/docker", "-H", sock, "run", "--name", "_tmp_#{hostname}_ssh_key", "-v", "/tmp", "--entrypoint", "/bin/sh", "debian:jessie", "-c", "echo -e '#{ssh_key}' >> /tmp/id_rsa && chmod 600 /tmp/id_rsa")
+raise "Could not create SSH key container" unless $?.success?
+
+rsync_opts = "-e ssh -i /tmp/id_rsa -p #{opts[:port]} -rzop --partial --bwlimit=#{opts[:bwlimit]} --perms /volData #{opts[:user]}@#{opts[:host]}:#{opts[:remote_path]} "
+
+system("/usr/bin/docker", "-H", sock, "run", "--volumes-from", "_tmp_#{hostname}_ssh_key", "--rm", *volumes.map{|v| v.to_cli_arg}.flatten, "cpuguy83/rsync", *rsync_opts.split)
+raise "Could not run rsync container" unless $?.success?
+ensure
+  system("/usr/bin/docker", "-H", sock, "rm", "_tmp_#{hostname}_ssh_key")
 end
-
-ssh_key = open(ssh_key_path).read
-hostname = `hostname`
-system("/usr/bin/docker", "-H", sock, "run", "--name", "_tmp_#{hostname}_ssh_key", "-v", "/tmp", "--entrypoint", "/bin/bash", "debian:jessie", "-c \"echo #{ssh_key} >> /tmp/id_rsa && chmod 600 /tmp/id_rsa")
-
-
-rsync_opts = "-e ssh -i /tmp/id_rsa -p #{ssh_port} -rzop --partial /volData #{rsync_user}@#{rsync_host}:#{remote_path} "
-if rsync_extra_opts.any?
-  rsync_opts << rsync_extra_opts.join(" ")
-end
-
-
-system("/usr/bin/docker", "-H", sock, "run", "--volumes-from", "_tmp_#{hostname}_ssh_key", "--rm", "-v", volumes.chomp, "cpuguy83/rsync", *rsnyc_opts.split)
-system("/usr/bin/docker", "-H", sock, "rm", "_tmp_#{hostname}_ssh_key")
