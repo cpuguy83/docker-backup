@@ -1,10 +1,5 @@
 #!/usr/bin/env ruby
 require 'open-uri'
-begin
-  gem 'slop'
-rescue Gem::LoadError
-  `gem install slop`
-end
 require 'slop'
 
 
@@ -38,13 +33,7 @@ opts = Slop.parse(arguments: true) do
   banner "volbackup.rb [options]"
 
   on 'c', 'containers', 'Comma-sepparated list(no spaces) of Name/ID of Containers to backup volumes for', as: Array, default: []
-  on 'h', 'host', 'Remote host to sync backups to, format: <user@>host<:port>', required: true
-  on 'u', 'user', 'RSync/SSH user', default: 'backup'
-  on 'k', 'key', 'RSync/SSH key path', default: '/Backup/.ssh/id_rsa'
-  on 'p', 'port', 'RSync/SSH port', default: 22
   on 's', 'sock', 'Location of Docker socket', default: '/var/run/docker.sock'
-  on 'r', 'remote_path', 'Path to store data on remote server', default: '~/backups/'
-  on 'b', 'bwlimit', 'Throttle bandwidth, KBPS', default: 0
 end
 
 sock = if opts[:sock] =~ /^\//
@@ -72,15 +61,8 @@ volumes = containers.inject([]) { |result, container|
 
 
 hostname = `hostname`.chomp
+image = `docker -H #{sock} inspect --format '{{ .Config.Image }}' #{hostname}`.chomp
+backup_path = "#{ENV["RUBY_PATH"]}/bin/backup"
 
-begin
-system("/usr/bin/docker", "-H", sock, "run", "--name", "_tmp_#{hostname}_ssh_key", "-v", "/tmp", "--entrypoint", "/bin/sh", "debian:jessie", "-c", "echo -e '#{ssh_key}' >> /tmp/id_rsa && chmod 600 /tmp/id_rsa")
-raise "Could not create SSH key container" unless $?.success?
+exec('/usr/bin/docker', '-H', sock, 'run', '--volumes-from',  hostname, '--rm', *(volumes.map{|v| v.to_cli_arg}.flatten), '-e', "MAIL_PASS=#{ENV['MAIL_PASS']}", '--entrypoint', backup_path, image, 'perform', '--root-path', '/Backup/', '-t', 'volumes')
 
-rsync_opts = "-e ssh -i /tmp/id_rsa -p #{opts[:port]} -rzop --partial --bwlimit=#{opts[:bwlimit]} --perms /volData #{opts[:user]}@#{opts[:host]}:#{opts[:remote_path]} "
-
-system("/usr/bin/docker", "-H", sock, "run", "--volumes-from", "_tmp_#{hostname}_ssh_key", "--rm", *volumes.map{|v| v.to_cli_arg}.flatten, "cpuguy83/rsync", *rsync_opts.split)
-raise "Could not run rsync container" unless $?.success?
-ensure
-  system("/usr/bin/docker", "-H", sock, "rm", "_tmp_#{hostname}_ssh_key")
-end
