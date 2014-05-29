@@ -64,5 +64,13 @@ hostname = `hostname`.chomp
 image = `docker -H #{sock} inspect --format '{{ .Config.Image }}' #{hostname}`.chomp
 backup_path = "#{ENV["RUBY_PATH"]}/bin/backup"
 
-exec('/usr/bin/docker', '-H', sock, 'run', '--volumes-from',  hostname, '--rm', *(volumes.map{|v| v.to_cli_arg}.flatten), '-e', "MAIL_PASS=#{ENV['MAIL_PASS']}", '--entrypoint', backup_path, image, 'perform', '--root-path', '/Backup/', '-t', 'volumes')
+env = ENV.map {|key, value|
+  unless ["HOSTNAME", "TERM", "PATH", "PWD", "SHLVL", "_", "LINES", "COLUMNS", "HOME"].include? key
+    ['-e', "#{key}=#{value}"]
+  end
+}.compact
+
+
+
+exec('/usr/bin/docker', '-H', sock, 'run', '--volumes-from',  hostname, '--rm', *(volumes.map{|v| v.to_cli_arg}.flatten), *env.flatten, '--entrypoint', backup_path, image, 'perform', '--root-path', '/Backup/', '-t', 'volumes')
 
