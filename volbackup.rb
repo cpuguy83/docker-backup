@@ -1,31 +1,109 @@
 #!/usr/bin/env ruby
 require 'open-uri'
 require 'slop'
+require 'excon'
+require 'ostruct'
+require 'json'
 
 
-class Volume
-  attr_reader :host_path, :container_path
-  def initialize(host, container)
-    @host_path = host
-    @container_path = container
+class Docker
+  class Gateway
+    attr_reader :conn
+    def initialize(sock)
+      @conn = build_conn(sock)
+    end
+
+    def get(path)
+      JSON.parse(conn.get(path: path).body)
+    end
+
+    def post(path, body)
+      if body
+        JSON.parse(conn.post(path: path, body: body).body)
+      else
+        JSON.parse(conn.post(path: path).body)
+      end
+    end
+  private
+    def build_conn(sock)
+      sock = if sock =~ /^\//
+               "unix://#{sock}"
+             else
+               sock
+             end
+      proto = sock.split('://')[0]
+      sock = sock.split('://')[1]
+
+      conn = case proto
+             when 'unix'
+               Excon.new('unix:///', socket: sock)
+             when 'tcp'
+               Excon.new("http://#{sock}")
+             else
+               raise 'Unsupported socket protocol'
+             end
+      conn
+    end
+
+  end
+  class Container < OpenStruct
+    def to_json
+      to_h.to_json
+    end
   end
 
-  def ==(other)
-    host_path == other.host_path
+  class Volume
+    attr_reader :host_path, :container_path
+    def initialize(vol={})
+      @container_path = vol.keys.first
+      @host_path = vol.values.first
+    end
+
+    def ==(other)
+      host_path == other.host_path
+    end
+
+    def hash
+      [host_path, Volume].hash
+    end
+
+    alias_method :eql?, :==
+
+    def to_s
+      "#{host_path}:#{container_path}"
+    end
+
+    def to_cli_arg
+      ['-v', to_s]
+    end
   end
 
-  def hash
-    [host_path, Volume].hash
+  attr_reader :conn
+  def initialize(sock)
+    @conn = Gateway.new(sock)
   end
 
-  alias_method :eql?, :==
-
-  def to_s
-    "#{host_path}:#{container_path}"
+  def fetch_all_containers
+    conn.get('/containers/json?all=true').map{|c| Container.new sanitize_hash_keys(c)}
   end
 
-  def to_cli_arg
-    ['-v', to_s]
+  def fetch_container(id)
+    Container.new sanitize_hash_keys(conn.get("/containers/#{id}/json"))
+  end
+
+  def create_container(container)
+    conn.post('/containers/create', container.to_json)
+  end
+
+  def start_container(container)
+    conn.post("/containers/#{container.id}/start", container.host_config.to_json)
+  end
+
+private
+  def sanitize_hash_keys(hash)
+    hash.inject({}) { |result, arr|
+      result.merge(arr[0].downcase => arr[1])
+    }
   end
 end
 
@@ -36,41 +114,49 @@ opts = Slop.parse(arguments: true) do
   on 's', 'sock', 'Location of Docker socket', default: '/var/run/docker.sock'
 end
 
-sock = if opts[:sock] =~ /^\//
-         "unix://#{opts[:sock]}"
-       else
-         opts[:sock]
-       end
-
-
-if File.exists?("/.dockerinit") && !File.exists?("/usr/bin/docker")
-  system("cp", "/.dockerinit", "/usr/bin/docker")
-end
+docker = Docker.new(opts[:sock])
 
 if opts[:containers].empty?
-  cids = `docker -H #{sock} ps -a -q`
-  containers = cids.split
+  containers = docker.fetch_all_containers.map(&:id)
 else
   containers = opts[:containers]
 end
 
-volumes = containers.inject([]) { |result, container|
-  vols = `docker -H #{sock} inspect --format '{{ $name := .Name }}{{ range $volPath, $hostPath := .Volumes }}{{ $hostPath }}:/volData{{$name}}{{ $volPath }} {{ end }}' #{container}`.chomp.split(' ')
-  result + vols.map{|v| v.split(':')}.map{|v| Volume.new(v[0], v[1])}
-}.uniq
-
+volumes = containers.map{|c|
+  vol = docker.fetch_container(c).volumes
+  Docker::Volume.new(vol) unless vol.keys.first == nil
+}.uniq.compact
 
 hostname = `hostname`.chomp
-image = `docker -H #{sock} inspect --format '{{ .Config.Image }}' #{hostname}`.chomp
+image = docker.fetch_container(hostname).image
 backup_path = "#{ENV["RUBY_PATH"]}/bin/backup"
 
 env = ENV.map {|key, value|
   unless ["HOSTNAME", "TERM", "PATH", "PWD", "SHLVL", "_", "LINES", "COLUMNS", "HOME"].include? key
-    ['-e', "#{key}=#{value}"]
+    "#{key}=#{value}"
   end
 }.compact
 
+container = Docker::Container.new(
+  Image: image,
+  Entrypoint: [backup_path],
+  Env: env,
+  Cmd: [
+    'perform',
+    '--root-path',
+    '/Backup/',
+    '-t',
+    'volumes'
+  ],
+)
+
+cid = docker.create_container(container)["Id"]
+container = docker.fetch_container(cid)
+container.host_config = { Binds: volumes.map(&:to_s) }
+
+docker.start_container(container)
 
 
-exec('/usr/bin/docker', '-H', sock, 'run', '--volumes-from',  hostname, '--rm', *(volumes.map{|v| v.to_cli_arg}.flatten), *env.flatten, '--entrypoint', backup_path, image, 'perform', '--root-path', '/Backup/', '-t', 'volumes')
-
+# TODO: Convert to API instead of CLI
+#exec('/usr/bin/docker', '-H', sock, 'run', '--volumes-from',  hostname, '--rm', *(volumes.map{|v| v.to_cli_arg}.flatten), *env.flatten, '--entrypoint', backup_path, image, 'perform', '--root-path', '/Backup/', '-t', 'volumes')
+#
